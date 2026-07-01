@@ -10,8 +10,13 @@ import yfinance as yf
 
 from core.enums import Sector
 from core.exceptions import DataFetchError, InvalidTickerError
-from core.models import CompanyInfo, FundamentalsSnapshot
+from core.models import CompanyInfo, FundamentalsSnapshot, TickerSearchResult
 from utils.logger import logger
+
+# Types d'instruments acceptés lors de la résolution nom -> ticker.
+# On exclut volontairement CRYPTOCURRENCY/FUTURE/OPTION pour rester
+# dans le périmètre "actions" de l'application.
+ACCEPTED_SEARCH_TYPES = {"EQUITY", "ETF", "INDEX", "MUTUALFUND"}
 
 
 class YahooFinanceFetcher:
@@ -104,4 +109,60 @@ class YahooFinanceFetcher:
             except DataFetchError as exc:
                 logger.warning(f"Batch fetch: {ticker} ignoré — {exc.reason}")
         logger.info(f"Batch terminé: {len(results)}/{len(tickers)} tickers récupérés")
+        return results
+
+    def search_ticker(self, query: str, max_results: int = 8) -> list[TickerSearchResult]:
+        """
+        Résout un nom d'entreprise (ou fragment de nom/ticker) vers une
+        liste de tickers candidats, triés par pertinence Yahoo Finance.
+
+        Permet à l'utilisateur de taper "Apple" et de se voir proposer
+        "AAPL — Apple Inc." sans connaître le symbole à l'avance.
+
+        Args:
+            query: texte tapé par l'utilisateur (nom, fragment, ou ticker).
+            max_results: nombre maximum de résultats retournés.
+
+        Returns:
+            Liste de TickerSearchResult, vide si aucune correspondance ou
+            si la requête est trop courte pour être significative.
+        """
+        query = (query or "").strip()
+        if len(query) < 1:
+            return []
+
+        logger.debug(f"Recherche de ticker pour: '{query}'")
+        try:
+            search = yf.Search(query, max_results=max_results)
+            quotes = search.quotes or []
+        except Exception as exc:
+            logger.warning(f"Échec de la recherche de ticker pour '{query}': {exc}")
+            return []
+
+        results: list[TickerSearchResult] = []
+        for i, quote in enumerate(quotes):
+            symbol = quote.get("symbol")
+            if not symbol:
+                continue
+
+            quote_type = (quote.get("quoteType") or "").upper()
+            if quote_type and quote_type not in ACCEPTED_SEARCH_TYPES:
+                continue
+
+            name = quote.get("shortname") or quote.get("longname") or symbol
+            # Score décroissant selon la position retournée par Yahoo Finance
+            # (déjà trié par pertinence côté API).
+            score = max_results - i
+
+            results.append(
+                TickerSearchResult(
+                    symbol=symbol,
+                    name=name,
+                    exchange=quote.get("exchange"),
+                    type=quote_type or None,
+                    score=float(score),
+                )
+            )
+
+        logger.debug(f"Recherche '{query}': {len(results)} résultats exploitables")
         return results
