@@ -1,5 +1,6 @@
 """Fenêtre principale StockInvest Pro : layout terminal (top bar, gauche, centre, droite, bas)."""
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -10,7 +11,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtCore import Qt
 
 from core.enums import MarketRegime
 from core.models import QuantScore
@@ -38,6 +38,13 @@ class MainWindow(QMainWindow):
     Toute la logique métier (fetch, nettoyage, scoring...) transite par
     MarketOrchestrator, exécuté dans des QThread dédiés pour ne jamais
     geler l'interface.
+
+    Gestion des threads : tous les QThread créés sont conservés dans
+    self._workers tant qu'ils tournent, pour éviter que Python ne les
+    garbage-collect pendant leur exécution (source du warning
+    "QThread: Destroyed while thread is still running"). Ils sont
+    retirés de la liste dès qu'ils émettent finished, et la fenêtre
+    attend leur arrêt complet à la fermeture (closeEvent).
     """
 
     def __init__(
@@ -53,7 +60,9 @@ class MainWindow(QMainWindow):
         self.default_watchlist = default_watchlist
 
         self._latest_universe_result: UniverseAnalysisResult | None = None
-        self._active_worker = None  # référence forte pour éviter le GC pendant l'exécution
+        self._workers: list = []  # référence forte vers tous les QThread en cours
+        self._initial_load_in_progress = True
+        self._pending_ticker: str | None = None  # sélection reçue pendant le chargement initial
 
         self.setWindowTitle("StockInvest Pro — Terminal Quantitatif")
         self.resize(1600, 950)
@@ -76,8 +85,6 @@ class MainWindow(QMainWindow):
         top_bar = QWidget()
         top_bar_layout = QHBoxLayout(top_bar)
 
-        # Barre de recherche avec autocomplétion nom d'entreprise -> ticker
-        # (ex: taper "Apple" propose "AAPL — Apple Inc." dans une liste déroulante).
         self.search_bar = SearchBarWidget(self.orchestrator)
         self.search_bar.ticker_chosen.connect(self._on_ticker_selected)
 
@@ -140,22 +147,49 @@ class MainWindow(QMainWindow):
         self.simulator_page.run_requested.connect(self._on_backtest_requested)
 
     # ------------------------------------------------------------------
+    # GESTION DU CYCLE DE VIE DES THREADS
+    # ------------------------------------------------------------------
+
+    def _track_worker(self, worker) -> None:
+        """
+        Enregistre un QThread dans self._workers pour empêcher le garbage
+        collector de le détruire pendant qu'il tourne, et le retire
+        automatiquement de la liste une fois terminé.
+        """
+        self._workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._untrack_worker(w))
+
+    def _untrack_worker(self, worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+
+    def closeEvent(self, event) -> None:
+        """Attend l'arrêt propre de tous les threads avant de fermer la fenêtre."""
+        logger.info(f"Fermeture : attente de {len(self._workers)} thread(s) en cours...")
+        for worker in list(self._workers):
+            worker.quit()
+            worker.wait(5000)  # 5s max par thread, évite un blocage infini
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
     # CHARGEMENT INITIAL — analyse de la watchlist par défaut au démarrage
     # ------------------------------------------------------------------
 
     def _start_initial_load(self) -> None:
+        self._initial_load_in_progress = True
         self._status_label.setText(f"Analyse de {len(self.default_watchlist)} tickers en cours...")
 
-        self._active_worker = UniverseAnalysisWorker(self.orchestrator, self.default_watchlist)
-        self._active_worker.progress.connect(self._on_analysis_progress)
-        self._active_worker.finished_ok.connect(self._on_universe_analysis_done)
-        self._active_worker.failed.connect(self._on_worker_failed)
-        self._active_worker.start()
+        universe_worker = UniverseAnalysisWorker(self.orchestrator, self.default_watchlist)
+        universe_worker.progress.connect(self._on_analysis_progress)
+        universe_worker.finished_ok.connect(self._on_universe_analysis_done)
+        universe_worker.failed.connect(self._on_worker_failed)
+        self._track_worker(universe_worker)
+        universe_worker.start()
 
-        # Rafraîchissement léger du ticker tape en parallèle (quotes rapides)
-        self._quotes_worker = WatchlistQuotesWorker(self.orchestrator, self.default_watchlist)
-        self._quotes_worker.finished_ok.connect(self._on_quotes_ready)
-        self._quotes_worker.start()
+        quotes_worker = WatchlistQuotesWorker(self.orchestrator, self.default_watchlist)
+        quotes_worker.finished_ok.connect(self._on_quotes_ready)
+        self._track_worker(quotes_worker)
+        quotes_worker.start()
 
     def _on_analysis_progress(self, done: int, total: int, ticker: str) -> None:
         self._status_label.setText(f"Analyse en cours ({done}/{total}) : {ticker}")
@@ -169,6 +203,8 @@ class MainWindow(QMainWindow):
 
     def _on_universe_analysis_done(self, result: UniverseAnalysisResult) -> None:
         self._latest_universe_result = result
+        self._initial_load_in_progress = False
+
         n_ok = len(result.quant_scores)
         n_failed = len(result.failed_tickers)
         self._status_label.setText(f"Analyse terminée : {n_ok} tickers scorés, {n_failed} échoués")
@@ -177,7 +213,16 @@ class MainWindow(QMainWindow):
         self._populate_quant_engine(result)
         self._populate_command_center(result)
 
+        # Si l'utilisateur a cliqué un ticker pendant le chargement initial,
+        # on traite sa sélection maintenant plutôt que de l'avoir ignorée
+        # ou d'avoir lancé une analyse concurrente redondante.
+        if self._pending_ticker:
+            pending = self._pending_ticker
+            self._pending_ticker = None
+            self._on_ticker_selected(pending)
+
     def _on_worker_failed(self, message: str) -> None:
+        self._initial_load_in_progress = False
         self._status_label.setText(f"Erreur : {message}")
         logger.error(f"Worker en échec: {message}")
 
@@ -186,26 +231,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _populate_quant_engine(self, result: UniverseAnalysisResult) -> None:
+        from core.enums import FactorType
+
         rows = []
         for ticker, score in result.quant_scores.items():
             pr = result.ticker_results.get(ticker)
             company = pr.company if pr else None
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "name": company.name if company else ticker,
-                    "sector": company.sector.value if company else "Unknown",
-                    "country": company.country if company else None,
-                    "global_score": score.global_score,
-                }
-            )
-            # Ajoute explicitement chaque facteur pour le tableau (colonnes Value/Growth/...)
-            from core.enums import FactorType
-
-            last_row = rows[-1]
+            row = {
+                "ticker": ticker,
+                "name": company.name if company else ticker,
+                "sector": company.sector.value if company else "Unknown",
+                "country": company.country if company else None,
+                "global_score": score.global_score,
+            }
             for factor_type in FactorType:
                 fs = score.factor_scores.get(factor_type)
-                last_row[factor_type.value] = fs.zscore if fs else 0.0
+                row[factor_type.value] = fs.zscore if fs else 0.0
+            rows.append(row)
 
         self.quant_engine_page.load_scores(rows)
 
@@ -248,14 +290,19 @@ class MainWindow(QMainWindow):
     def _on_ticker_selected(self, ticker: str) -> None:
         """
         Point d'entrée central quand un ticker est sélectionné n'importe où
-        dans l'UI (market watch, quant engine, ou résolution nom -> ticker
-        via la barre de recherche) : recharge le chart depuis la base, lance
-        le Deep Dive complet (sentiment + résumé IA) en arrière-plan, et
-        bascule l'onglet.
+        dans l'UI. Si le chargement initial de la watchlist est encore en
+        cours, la sélection est mise en file d'attente plutôt que de
+        déclencher une analyse concurrente redondante.
         """
         if not ticker:
             return
         ticker = ticker.strip().upper()
+
+        if self._initial_load_in_progress:
+            self._pending_ticker = ticker
+            self._status_label.setText(f"{ticker} sera affiché dès la fin du chargement initial...")
+            return
+
         logger.debug(f"Ticker sélectionné dans l'UI: {ticker}")
 
         df = self.repository.get_price_history(ticker)
@@ -271,12 +318,13 @@ class MainWindow(QMainWindow):
         )
         if quant_score is None:
             self._status_label.setText(f"{ticker} : pas encore scoré, analyse en cours...")
-            self._active_worker = UniverseAnalysisWorker(self.orchestrator, [ticker])
-            self._active_worker.finished_ok.connect(
+            worker = UniverseAnalysisWorker(self.orchestrator, [ticker])
+            worker.finished_ok.connect(
                 lambda result, t=ticker: self._on_single_ticker_scored(t, result)
             )
-            self._active_worker.failed.connect(self._on_worker_failed)
-            self._active_worker.start()
+            worker.failed.connect(self._on_worker_failed)
+            self._track_worker(worker)
+            worker.start()
             return
 
         self.quant_hud.update_score(quant_score)
@@ -291,12 +339,13 @@ class MainWindow(QMainWindow):
         self._launch_deep_dive_worker(ticker, score)
 
     def _launch_deep_dive_worker(self, ticker: str, quant_score: QuantScore) -> None:
-        self._deep_dive_worker = DeepDiveWorker(self.orchestrator, ticker, quant_score)
-        self._deep_dive_worker.finished_ok.connect(
+        worker = DeepDiveWorker(self.orchestrator, ticker, quant_score)
+        worker.finished_ok.connect(
             lambda payload, t=ticker, s=quant_score: self._on_deep_dive_ready(t, s, payload)
         )
-        self._deep_dive_worker.failed.connect(self._on_worker_failed)
-        self._deep_dive_worker.start()
+        worker.failed.connect(self._on_worker_failed)
+        self._track_worker(worker)
+        worker.start()
 
     def _on_deep_dive_ready(self, ticker: str, quant_score: QuantScore, payload: tuple) -> None:
         sentiment, summary = payload
@@ -327,8 +376,6 @@ class MainWindow(QMainWindow):
         result = self._latest_universe_result
         price_data = {t: pr.price_history for t, pr in result.ticker_results.items()}
 
-        # Score history simplifié : score constant dans le temps (pas de recalcul
-        # historique dans cette version — amélioration future : scores datés).
         dates = next(iter(price_data.values())).index if price_data else pd.DatetimeIndex([])
         score_history = pd.DataFrame(
             {t: result.quant_scores[t].global_score for t in result.quant_scores if t in price_data},

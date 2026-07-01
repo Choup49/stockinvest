@@ -16,6 +16,7 @@ class AppConfig:
     database_url: str
     min_dollar_volume: float
     default_period: str
+    default_watchlist: list[str]
     openai_api_key: str | None
     use_openai: bool
     theme_background: str
@@ -42,10 +43,16 @@ class ConfigLoader:
         ai = self._parser["ai"]
         theme = self._parser["theme"]
 
+        watchlist_raw = pipeline.get(
+            "default_watchlist", "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,V,UNH"
+        )
+        default_watchlist = [t.strip().upper() for t in watchlist_raw.split(",") if t.strip()]
+
         config = AppConfig(
             database_url=db.get("url", "sqlite:///stockinvest.db"),
             min_dollar_volume=pipeline.getfloat("min_dollar_volume", 250_000.0),
             default_period=pipeline.get("default_period", "2y"),
+            default_watchlist=default_watchlist,
             openai_api_key=ai.get("openai_api_key", fallback=None) or None,
             use_openai=ai.getboolean("use_openai", False),
             theme_background=theme.get("background", "#0B0C10"),
@@ -60,6 +67,7 @@ class ConfigLoader:
         self._parser["pipeline"] = {
             "min_dollar_volume": "250000",
             "default_period": "2y",
+            "default_watchlist": "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,V,UNH",
         }
         self._parser["ai"] = {"use_openai": "false", "openai_api_key": ""}
         self._parser["theme"] = {
