@@ -1,10 +1,26 @@
-"""Fenêtre principale StockInvest Pro : layout terminal (top bar, gauche, centre, droite, bas)."""
+"""
+Fenêtre principale StockInvest Pro : layout terminal moderne et responsive.
+
+Responsive (obligatoire) :
+    - Large (>= 1400px)  : 3 colonnes Market / Chart / HUD, splitter horizontal.
+    - Moyen (>= 900px)   : 2 colonnes Market + Chart, HUD replié en panneau
+                           accessible via un bouton bascule dans la top bar.
+    - Étroit (< 900px)   : 1 colonne, Market/Chart/HUD empilés verticalement,
+                           navigation uniquement par les onglets du bas.
+
+Navigation moderne :
+    - Command Palette (Ctrl+K / Cmd+K) pour sauter vers une page ou un ticker
+      sans la souris.
+    - Sidebar (Market Watch) repliable via un bouton dans la top bar.
+"""
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QSplitter,
     QStatusBar,
     QTabWidget,
@@ -20,8 +36,9 @@ from ui.pages.command_center import CommandCenterPage
 from ui.pages.deep_dive import DeepDivePage
 from ui.pages.quant_engine import QuantEnginePage
 from ui.pages.simulator import SimulatorPage
-from ui.theme import build_qss
+from ui.theme import BREAKPOINT_MEDIUM, BREAKPOINT_WIDE, LayoutMode, build_qss
 from ui.widgets.chart_view import ChartViewWidget
+from ui.widgets.command_palette import CommandPaletteDialog
 from ui.widgets.market_watch import MarketWatchWidget
 from ui.widgets.quant_hud import QuantHudWidget
 from ui.widgets.search_bar import SearchBarWidget
@@ -29,22 +46,19 @@ from ui.widgets.ticker_tape import TickerTapeWidget
 from ui.workers import DeepDiveWorker, UniverseAnalysisWorker, WatchlistQuotesWorker
 from utils.logger import logger
 
+PAGE_ACTION_MAP = {
+    "page:command_center": 0,
+    "page:deep_dive": 1,
+    "page:quant_engine": 2,
+    "page:simulator": 3,
+}
+
 
 class MainWindow(QMainWindow):
     """
-    Fenêtre principale : assemble top bar, market watch (gauche), chart
-    (centre), quant HUD (droite), et les 4 pages en onglets (bas).
-
-    Toute la logique métier (fetch, nettoyage, scoring...) transite par
-    MarketOrchestrator, exécuté dans des QThread dédiés pour ne jamais
-    geler l'interface.
-
-    Gestion des threads : tous les QThread créés sont conservés dans
-    self._workers tant qu'ils tournent, pour éviter que Python ne les
-    garbage-collect pendant leur exécution (source du warning
-    "QThread: Destroyed while thread is still running"). Ils sont
-    retirés de la liste dès qu'ils émettent finished, et la fenêtre
-    attend leur arrêt complet à la fermeture (closeEvent).
+    Fenêtre principale. Toute la logique métier transite par
+    MarketOrchestrator, exécuté dans des QThread suivis dans self._workers
+    pour ne jamais être détruits pendant leur exécution.
     """
 
     def __init__(
@@ -60,9 +74,12 @@ class MainWindow(QMainWindow):
         self.default_watchlist = default_watchlist
 
         self._latest_universe_result: UniverseAnalysisResult | None = None
-        self._workers: list = []  # référence forte vers tous les QThread en cours
+        self._workers: list = []
         self._initial_load_in_progress = True
-        self._pending_ticker: str | None = None  # sélection reçue pendant le chargement initial
+        self._pending_ticker: str | None = None
+        self._current_layout_mode: str | None = None
+        self._sidebar_collapsed = False
+        self._hud_visible = True
 
         self.setWindowTitle("StockInvest Pro — Terminal Quantitatif")
         self.resize(1600, 950)
@@ -73,7 +90,12 @@ class MainWindow(QMainWindow):
         }))
 
         self._build_ui()
+        self._setup_command_palette()
         self._start_initial_load()
+
+    # ------------------------------------------------------------------
+    # CONSTRUCTION DE L'UI
+    # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -84,27 +106,49 @@ class MainWindow(QMainWindow):
         # --- TOP BAR ---
         top_bar = QWidget()
         top_bar_layout = QHBoxLayout(top_bar)
+        top_bar_layout.setContentsMargins(12, 8, 12, 8)
+
+        self.sidebar_toggle_btn = QPushButton("☰")
+        self.sidebar_toggle_btn.setObjectName("ghost")
+        self.sidebar_toggle_btn.setFixedWidth(32)
+        self.sidebar_toggle_btn.setToolTip("Afficher/masquer le Market Watch")
+        self.sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
 
         self.search_bar = SearchBarWidget(self.orchestrator)
         self.search_bar.ticker_chosen.connect(self._on_ticker_selected)
 
+        self.command_palette_btn = QPushButton("⌘K")
+        self.command_palette_btn.setObjectName("ghost")
+        self.command_palette_btn.setToolTip("Command Palette (Ctrl+K)")
+        self.command_palette_btn.clicked.connect(self._open_command_palette)
+
+        self.hud_toggle_btn = QPushButton("HUD")
+        self.hud_toggle_btn.setObjectName("ghost")
+        self.hud_toggle_btn.setToolTip("Afficher/masquer le panneau Quant HUD")
+        self.hud_toggle_btn.clicked.connect(self._toggle_hud)
+        self.hud_toggle_btn.hide()  # visible uniquement en mode Medium
+
         self.ticker_tape = TickerTapeWidget()
+
+        top_bar_layout.addWidget(self.sidebar_toggle_btn)
         top_bar_layout.addWidget(self.search_bar, stretch=1)
+        top_bar_layout.addWidget(self.command_palette_btn)
+        top_bar_layout.addWidget(self.hud_toggle_btn)
         top_bar_layout.addWidget(self.ticker_tape, stretch=3)
 
-        # --- ZONE CENTRALE (gauche / centre / droite) ---
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # --- ZONE CENTRALE ---
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.market_watch = MarketWatchWidget()
         self.chart_view = ChartViewWidget()
         self.quant_hud = QuantHudWidget()
 
-        main_splitter.addWidget(self.market_watch)
-        main_splitter.addWidget(self.chart_view)
-        main_splitter.addWidget(self.quant_hud)
-        main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 3)
-        main_splitter.setStretchFactor(2, 1)
+        self.main_splitter.addWidget(self.market_watch)
+        self.main_splitter.addWidget(self.chart_view)
+        self.main_splitter.addWidget(self.quant_hud)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 3)
+        self.main_splitter.setStretchFactor(2, 1)
 
         # --- BAS : onglets ---
         self.tabs = QTabWidget()
@@ -118,14 +162,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.quant_engine_page, "Quant Engine")
         self.tabs.addTab(self.simulator_page, "Simulator")
 
-        vertical_splitter = QSplitter(Qt.Orientation.Vertical)
-        vertical_splitter.addWidget(main_splitter)
-        vertical_splitter.addWidget(self.tabs)
-        vertical_splitter.setStretchFactor(0, 3)
-        vertical_splitter.setStretchFactor(1, 2)
+        self.vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.vertical_splitter.addWidget(self.main_splitter)
+        self.vertical_splitter.addWidget(self.tabs)
+        self.vertical_splitter.setStretchFactor(0, 3)
+        self.vertical_splitter.setStretchFactor(1, 2)
 
         root_layout.addWidget(top_bar)
-        root_layout.addWidget(vertical_splitter)
+        root_layout.addWidget(self.vertical_splitter)
 
         self.setCentralWidget(central)
 
@@ -147,15 +191,78 @@ class MainWindow(QMainWindow):
         self.simulator_page.run_requested.connect(self._on_backtest_requested)
 
     # ------------------------------------------------------------------
+    # COMMAND PALETTE (Ctrl+K / Cmd+K)
+    # ------------------------------------------------------------------
+
+    def _setup_command_palette(self) -> None:
+        self._command_palette = CommandPaletteDialog(self.orchestrator, parent=self)
+        self._command_palette.page_requested.connect(self._on_palette_page_requested)
+        self._command_palette.ticker_requested.connect(self._on_ticker_selected)
+
+        # Ctrl+K sous Windows/Linux, Cmd+K sous macOS (QKeySequence gère la
+        # traduction automatique via le rôle StandardKey non disponible ici,
+        # donc on enregistre explicitement les deux combinaisons usuelles).
+        QShortcut(QKeySequence("Ctrl+K"), self, activated=self._open_command_palette)
+        QShortcut(QKeySequence("Meta+K"), self, activated=self._open_command_palette)
+
+    def _open_command_palette(self) -> None:
+        self._command_palette.show()
+
+    def _on_palette_page_requested(self, action_id: str) -> None:
+        index = PAGE_ACTION_MAP.get(action_id)
+        if index is not None:
+            self.tabs.setCurrentIndex(index)
+
+    # ------------------------------------------------------------------
+    # RESPONSIVE — bascule de layout selon la largeur de la fenêtre
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        mode = LayoutMode.from_width(self.width())
+        if mode != self._current_layout_mode:
+            self._current_layout_mode = mode
+            self._apply_layout_mode(mode)
+
+    def _apply_layout_mode(self, mode: str) -> None:
+        logger.debug(f"Layout responsive : passage en mode '{mode}' (largeur={self.width()}px)")
+
+        if mode == LayoutMode.WIDE:
+            # 3 colonnes classiques
+            self.main_splitter.setOrientation(Qt.Orientation.Horizontal)
+            self.market_watch.show()
+            self.quant_hud.show()
+            self.hud_toggle_btn.hide()
+            self._sidebar_collapsed = False
+            self._hud_visible = True
+
+        elif mode == LayoutMode.MEDIUM:
+            # 2 colonnes : Market + Chart. HUD repliable via bouton dédié.
+            self.main_splitter.setOrientation(Qt.Orientation.Horizontal)
+            self.market_watch.show()
+            self.hud_toggle_btn.show()
+            self.quant_hud.setVisible(self._hud_visible)
+
+        else:  # NARROW
+            # 1 colonne : tout empilé verticalement, navigation par onglets.
+            self.main_splitter.setOrientation(Qt.Orientation.Vertical)
+            self.market_watch.hide()
+            self.quant_hud.hide()
+            self.hud_toggle_btn.hide()
+
+    def _toggle_sidebar(self) -> None:
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        self.market_watch.setVisible(not self._sidebar_collapsed)
+
+    def _toggle_hud(self) -> None:
+        self._hud_visible = not self._hud_visible
+        self.quant_hud.setVisible(self._hud_visible)
+
+    # ------------------------------------------------------------------
     # GESTION DU CYCLE DE VIE DES THREADS
     # ------------------------------------------------------------------
 
     def _track_worker(self, worker) -> None:
-        """
-        Enregistre un QThread dans self._workers pour empêcher le garbage
-        collector de le détruire pendant qu'il tourne, et le retire
-        automatiquement de la liste une fois terminé.
-        """
         self._workers.append(worker)
         worker.finished.connect(lambda w=worker: self._untrack_worker(w))
 
@@ -164,15 +271,14 @@ class MainWindow(QMainWindow):
             self._workers.remove(worker)
 
     def closeEvent(self, event) -> None:
-        """Attend l'arrêt propre de tous les threads avant de fermer la fenêtre."""
         logger.info(f"Fermeture : attente de {len(self._workers)} thread(s) en cours...")
         for worker in list(self._workers):
             worker.quit()
-            worker.wait(5000)  # 5s max par thread, évite un blocage infini
+            worker.wait(5000)
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
-    # CHARGEMENT INITIAL — analyse de la watchlist par défaut au démarrage
+    # CHARGEMENT INITIAL
     # ------------------------------------------------------------------
 
     def _start_initial_load(self) -> None:
@@ -213,9 +319,6 @@ class MainWindow(QMainWindow):
         self._populate_quant_engine(result)
         self._populate_command_center(result)
 
-        # Si l'utilisateur a cliqué un ticker pendant le chargement initial,
-        # on traite sa sélection maintenant plutôt que de l'avoir ignorée
-        # ou d'avoir lancé une analyse concurrente redondante.
         if self._pending_ticker:
             pending = self._pending_ticker
             self._pending_ticker = None
@@ -227,7 +330,7 @@ class MainWindow(QMainWindow):
         logger.error(f"Worker en échec: {message}")
 
     # ------------------------------------------------------------------
-    # POPULATION DES PAGES À PARTIR DU RÉSULTAT D'ANALYSE
+    # POPULATION DES PAGES
     # ------------------------------------------------------------------
 
     def _populate_quant_engine(self, result: UniverseAnalysisResult) -> None:
@@ -284,16 +387,10 @@ class MainWindow(QMainWindow):
         self.command_center_page.update_top_movers(movers)
 
     # ------------------------------------------------------------------
-    # SÉLECTION D'UN TICKER (market watch, quant engine, barre de recherche)
+    # SÉLECTION D'UN TICKER
     # ------------------------------------------------------------------
 
     def _on_ticker_selected(self, ticker: str) -> None:
-        """
-        Point d'entrée central quand un ticker est sélectionné n'importe où
-        dans l'UI. Si le chargement initial de la watchlist est encore en
-        cours, la sélection est mise en file d'attente plutôt que de
-        déclencher une analyse concurrente redondante.
-        """
         if not ticker:
             return
         ticker = ticker.strip().upper()
@@ -362,7 +459,7 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------
-    # SIMULATOR — lance le backtest sur l'univers courant
+    # SIMULATOR
     # ------------------------------------------------------------------
 
     def _on_backtest_requested(self, params: dict) -> None:
