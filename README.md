@@ -10,6 +10,7 @@ Terminal quantitatif desktop professionnel — aide à la décision financière 
 
 ```bash
 # 1. Cloner / copier le projet, puis se placer à la racine
+git clone https://github.com/Choup49/stockinvest/blob/main/README.md
 cd StockInvestPro
 
 # 2. Créer un environnement virtuel (recommandé)
